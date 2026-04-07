@@ -28,7 +28,7 @@ class RbSteelProfitArbitrageRuleShapeClose:
         # 风控：10 天滚动、最大回撤 3%
         risk_days_window: int = 10,
         max_drawdown: float = 0.03,
-        # 按日历分块拉日线：底层 SQL 为逐日 UNION，全量一次会触发服务端 Max query size
+        # 按日历分块拉日线
         date_chunk_size: int = 20,
         adjust_method: str = "additive",  # "multiplicative" or "additive"
         margin_rate: float = 0.10,
@@ -251,7 +251,7 @@ class RbSteelProfitArbitrageRuleShapeClose:
         profit_df.columns = ["signal_date", "profit"]
         profit_df = profit_df.sort_values("signal_date").reset_index(drop=True)
 
-        # 布林带窗口：ma_window（std ddof=0，和参考策略一致）
+        # 布林带窗口：ma_window
         mid = profit_df["profit"].rolling(self.ma_window, min_periods=self.ma_window).mean()
         std = profit_df["profit"].rolling(self.ma_window, min_periods=self.ma_window).std(ddof=0)
         up = mid + self.up_std * std
@@ -285,7 +285,7 @@ class RbSteelProfitArbitrageRuleShapeClose:
             else:
                 state_new = 0
 
-            # 2) 判断 signal（完全照参考策略 if-elif 顺序）
+            # 2) 判断 signal
             if prev_state == 2 and state_new < 2:
                 sig = 2
             elif prev_state == -2 and state_new > -2:
@@ -432,7 +432,6 @@ class RbSteelProfitArbitrageRuleShapeClose:
                 "contract": "exec_contract",
             }
         )
-        # 模板同款字段：decision_date(=signal_date) -> date(=trade_date)
         exec_df = exec_df.rename(columns={"signal_date": "decision_date"})
         keep = [
             "date",
@@ -519,6 +518,7 @@ class RbSteelProfitArbitrageRuleShapeClose:
         return {"rb": rb_lots, "i": i_lots, "j": j_lots}
 
     def calc_fee(self, contract: str, price: float, lots: int, date_int: int, ex_type: int) -> float:
+        return 0.0
         if lots <= 0:
             return 0.0
 
@@ -616,7 +616,7 @@ class RbSteelProfitArbitrageRuleShapeClose:
                             price=px_today,
                             lots=int(st["lots"]),
                             date_int=int(d),
-                            ex_type=2,  # 平昨（教学版用 2）
+                            ex_type=2,  # 平昨
                         )
                         day_slip += self.calc_slippage(sym, px_today, int(st["lots"]))
                     st.update({"pos": 0, "lots": 0, "contract": None, "prev_mark": np.nan})
