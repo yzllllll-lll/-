@@ -1,0 +1,881 @@
+from __future__ import annotations
+
+import math
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+from qhdata.API.future import get_dominant, get_fut_daily_data, get_fut_fee
+
+class RbSteelProfitArbitrageRuleShapeClose:
+
+    def __init__(
+        self,
+        start_date: int,
+        end_date: int,
+        capital: float = 10_000_000.0,
+        # 制定一个安全的实际资金使用值
+        cash_ratio: float = 0.10,
+        # 参考策略：回看15天，上下标注差偏离为1.8
+        ma_window: int = 15,
+        up_std: float = 1.8,
+        down_std: float = 1.8,
+        # 参考策略利润系数：profit = 1*RB - 1.6*I - 0.5*J
+        x_rb: float = 1.0,
+        y_i: float = 1.6,
+        z_j: float = 0.5,
+        # 风控：10 天滚动、最大回撤 3%
+        risk_days_window: int = 10,
+        max_drawdown: float = 0.03,
+        # 按日历分块拉日线：底层 SQL 为逐日 UNION，全量一次会触发服务端 Max query size
+        date_chunk_size: int = 20,
+        adjust_method: str = "additive",  # "multiplicative" or "additive"
+        margin_rate: float = 0.10,
+        # 信号价格口径：LastPrice（默认）或 SettlePrice 这里使用收盘价
+        use_settle_for_signal: bool = False,
+    ):
+        self.start_date = int(start_date)
+        self.end_date = int(end_date)
+        self.capital = float(capital)
+
+        self.cash_ratio = float(cash_ratio)
+        # 实际使用的资金
+        self.cash_total = self.capital * self.cash_ratio
+
+        self.ma_window = int(ma_window)
+        self.up_std = float(up_std)
+        self.down_std = float(down_std)
+
+        self.x_rb = float(x_rb)
+        self.y_i = float(y_i)
+        self.z_j = float(z_j)
+
+        self.risk_days_window = int(risk_days_window)
+        self.max_drawdown = float(max_drawdown)
+
+        self.date_chunk_size = int(date_chunk_size)
+        self.adjust_method = str(adjust_method)
+        self.margin_rate = float(margin_rate)
+        self.use_settle_for_signal = bool(use_settle_for_signal)
+
+        # 滑点：单边万5（0.05%），双边千1（0.10%）
+        # 这里按“每次成交一侧”扣成本：开仓一次扣一次，平仓一次扣一次。
+        self.slippage_one_side_rate = 5e-4
+
+        # 交易品种（统一小写）
+        self.symbols = ["rb", "i", "j"]
+
+        # 合约乘数（元/点/手），用于把“目标资金”换算成手数
+        self.multiplier_map: Dict[str, int] = {"rb": 10, "i": 100, "j": 100}
+
+        # 信号触发对应的三腿方向（pos: +1 多 / -1 空 / 0 空仓）
+        self.signal_to_dir = {
+            2: {"rb": -1, "i": +1, "j": +1},   # “空螺纹、多铁矿、多焦煤”
+            -2: {"rb": +1, "i": -1, "j": -1},  # “多螺纹、空铁矿、空焦煤”
+        }
+
+    # ---------------------------------------------------------------------
+    # A) 数据准备：主力映射
+    # ---------------------------------------------------------------------
+    def get_main_contracts(self) -> pd.DataFrame:
+        """
+        获取主力合约映射表。
+        """
+        dom = get_dominant(
+            underlying_symbol=self.symbols,
+            start_date=self.start_date,
+            end_date=self.end_date,
+            data_class="mc",
+        ).copy()
+
+        dom.columns = [c.strip() for c in dom.columns]
+        dom["Varity"] = dom["Varity"].astype(str).str.lower()
+        dom["Date"] = dom["Date"].astype(int)
+        dom["TradingDate"] = dom["TradingDate"].astype(int)
+
+        dom = dom.rename(
+            columns={
+                "Varity": "symbol",
+                "Date": "signal_date",
+                "TradingDate": "trade_date",
+                "Main": "contract",
+            }
+        )
+        return dom[["symbol", "signal_date", "trade_date", "contract"]].sort_values(
+            ["symbol", "signal_date"]
+        ).reset_index(drop=True)
+
+    # ---------------------------------------------------------------------
+    # B) 数据准备：分块组织 get_fut_daily_data 的 query_contract_df
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def _build_query_contract_df_for_chunk(chunk_df: pd.DataFrame, date_col: str, contract_col: str) -> pd.DataFrame:
+        """
+        把“某一批日期需要查询的合约列表”组织成 get_fut_daily_data 的宽表查询矩阵。
+
+        通俗理解：
+        - index 是日期
+        - 每行是当天要查的合约（可能多个品种，所以是多列）
+        """
+        rows: Dict[int, List[str]] = {}
+        for dt, g in chunk_df.groupby(date_col):
+            rows[int(dt)] = g[contract_col].dropna().astype(str).tolist()
+
+        if not rows:
+            return pd.DataFrame()
+
+        max_len = max(len(v) for v in rows.values())
+        normalized = {dt: (lst + [""] * (max_len - len(lst))) for dt, lst in rows.items()}
+
+        qdf = pd.DataFrame.from_dict(normalized, orient="index")
+        qdf.index.name = "Date"
+        return qdf
+
+    def get_main_daily_data_chunked(self, main_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        按 signal_date 分块拉取主力合约日线。
+        """
+        unique_dates = sorted(main_df["signal_date"].unique().tolist())
+        parts: List[pd.DataFrame] = []
+
+        for i in range(0, len(unique_dates), self.date_chunk_size):
+            date_chunk = unique_dates[i : i + self.date_chunk_size]
+            chunk_main = main_df[main_df["signal_date"].isin(date_chunk)].copy()
+
+            query_contract_df = self._build_query_contract_df_for_chunk(
+                chunk_main, date_col="signal_date", contract_col="contract"
+            )
+            if query_contract_df.empty:
+                continue
+
+            chunk_daily = get_fut_daily_data(query_contract_df).copy()
+            chunk_daily.columns = [c.strip() for c in chunk_daily.columns]
+            chunk_daily["Varity"] = chunk_daily["Varity"].astype(str).str.lower()
+            chunk_daily["Date"] = chunk_daily["Date"].astype(int)
+
+            chunk_daily = chunk_daily.rename(
+                columns={
+                    "Varity": "symbol",
+                    "Contract": "contract",
+                    "ContractExtend": "contract_std",
+                    "Date": "signal_date",
+                }
+            )
+
+            # 信号价格口径：LastPrice 或 SettlePrice
+            if self.use_settle_for_signal and "SettlePrice" in chunk_daily.columns:
+                chunk_daily["px"] = chunk_daily["SettlePrice"]
+            else:
+                if "LastPrice" in chunk_daily.columns:
+                    chunk_daily["px"] = chunk_daily["LastPrice"]
+                elif "SettlePrice" in chunk_daily.columns:
+                    chunk_daily["px"] = chunk_daily["SettlePrice"]
+                else:
+                    raise ValueError("日线数据缺少 LastPrice/SettlePrice，无法生成 px")
+
+            parts.append(chunk_daily)
+
+        if not parts:
+            return pd.DataFrame()
+
+        daily = pd.concat(parts, axis=0, ignore_index=True)
+        daily = daily.merge(
+            main_df[["symbol", "signal_date", "trade_date", "contract"]],
+            on=["symbol", "signal_date", "contract"],
+            how="inner",
+        )
+        return daily.sort_values(["symbol", "signal_date"]).reset_index(drop=True)
+
+    # ---------------------------------------------------------------------
+    # C) 信号数据：取 signal_date 的主力收盘价，并做连续化（adj_px）
+    # ---------------------------------------------------------------------
+    def build_adjusted_price(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        构造连续价格 adj_px。
+        """
+        out = df.copy().sort_values(["symbol", "signal_date"]).reset_index(drop=True)
+        out["adj_px"] = np.nan
+
+        for sym, g in out.groupby("symbol", sort=False):
+            g = g.sort_values("signal_date").copy()
+            add_adj = 0.0
+            mul_adj = 1.0
+            vals: List[float] = []
+
+            for i in range(len(g)):
+                px = float(g.iloc[i]["px"])
+
+                if i > 0 and str(g.iloc[i]["contract"]) != str(g.iloc[i - 1]["contract"]):
+                    old_px = float(g.iloc[i - 1]["px"])
+                    new_px = float(g.iloc[i]["px"])
+
+                    if self.adjust_method == "additive":
+                        add_adj += old_px - new_px
+                    elif self.adjust_method == "multiplicative":
+                        if new_px != 0:
+                            mul_adj *= old_px / new_px
+                    else:
+                        raise ValueError("adjust_method 只能是 'multiplicative' 或 'additive'")
+
+                if self.adjust_method == "additive":
+                    vals.append(px + add_adj)
+                else:
+                    vals.append(px * mul_adj)
+
+            out.loc[g.index, "adj_px"] = vals
+
+        return out
+
+    # ---------------------------------------------------------------------
+    # D) 信号：profit + 状态机（完全复现 JoinQuant get_signal）
+    # ---------------------------------------------------------------------
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        生成 signal_date 的组合信号。
+
+        JoinQuant 原策略：
+        - se = 1*RB - 1.6*I - 0.5*J
+        - mid = mean(last ma days)
+        - up/down = mid ± std_mult * std(last ma days)
+        - state_new 取值：2/-2/1/-1/0（看 se 位于哪条轨道之间）
+        - signal 取值：2/-2/1/-1/0（看 state 是否发生特定穿越）
+        """
+        wide = df.pivot_table(index="signal_date", columns="symbol", values="adj_px")
+        for sym in self.symbols:
+            if sym not in wide.columns:
+                raise ValueError(f"信号价格缺少品种列: {sym}")
+
+        profit = self.x_rb * wide["rb"] - self.y_i * wide["i"] - self.z_j * wide["j"]
+        profit_df = profit.dropna().reset_index()
+        profit_df.columns = ["signal_date", "profit"]
+        profit_df = profit_df.sort_values("signal_date").reset_index(drop=True)
+
+        # 布林带窗口：ma_window（std ddof=0，和参考策略一致）
+        mid = profit_df["profit"].rolling(self.ma_window, min_periods=self.ma_window).mean()
+        std = profit_df["profit"].rolling(self.ma_window, min_periods=self.ma_window).std(ddof=0)
+        up = mid + self.up_std * std
+        down = mid - self.down_std * std
+
+        # 状态机：逐日推进（关键：prev_state 是跨天记忆）
+        prev_state = 0
+        states: List[int] = []
+        signals: List[int] = []
+
+        for i in range(len(profit_df)):
+            if pd.isna(mid.iloc[i]):
+                states.append(0)
+                signals.append(0)
+                continue
+
+            price_now = float(profit_df.loc[i, "profit"])
+            mid_i = float(mid.iloc[i])
+            up_i = float(up.iloc[i])
+            down_i = float(down.iloc[i])
+
+            # 1) 判断 state_new
+            if price_now > up_i:
+                state_new = 2
+            elif price_now < down_i:
+                state_new = -2
+            elif price_now > mid_i:
+                state_new = 1
+            elif price_now < mid_i:
+                state_new = -1
+            else:
+                state_new = 0
+
+            # 2) 判断 signal（完全照参考策略 if-elif 顺序）
+            if prev_state == 2 and state_new < 2:
+                sig = 2
+            elif prev_state == -2 and state_new > -2:
+                sig = -2
+            elif prev_state < 0 and state_new > 0:
+                sig = 1
+            elif prev_state > 0 and state_new < 0:
+                sig = -1
+            else:
+                sig = 0
+
+            states.append(int(state_new))
+            signals.append(int(sig))
+            prev_state = int(state_new)
+
+        profit_df["state"] = states
+        profit_df["signal"] = signals
+
+        # 把 profit/signal/state 回填到长表（方便后面 build_execution_table 直接 merge）
+        out = df.merge(profit_df, on="signal_date", how="left")
+        return out
+
+    def generate_target_signal(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        把指标层输出成“可执行的目标信号”。
+
+        关键点：
+        - JoinQuant 策略“只有触发信号时下单”，没触发时保持原仓位
+        - 模板回测器更偏向“每天给一个 target_pos”，未变化就 HOLD
+        因此这里把 2/-2 的触发信号，转换成“可持续持有的目标方向”：
+        - 当 signal=2  -> 目标方向更新为：rb=-1, i=+1, j=+1，并持续保持
+        - 当 signal=-2 -> 目标方向更新为：rb=+1, i=-1, j=-1，并持续保持
+        - 其它信号/无信号：目标方向不变（继续持有）
+        """
+        out = df.copy().sort_values(["symbol", "signal_date"]).reset_index(drop=True)
+
+        # 先按 signal_date 构造“组合级”的方向状态（持有型）
+        sig_daily = (
+            out[["signal_date", "signal"]]
+            .drop_duplicates("signal_date")
+            .sort_values("signal_date")
+            .reset_index(drop=True)
+        )
+
+        current_dir = {"rb": 0, "i": 0, "j": 0}
+        target_dir_rows: List[dict] = []
+        for r in sig_daily.itertuples(index=False):
+            sig = int(r.signal) if pd.notna(r.signal) else 0
+            if sig in self.signal_to_dir:
+                current_dir = dict(self.signal_to_dir[sig])
+
+            target_dir_rows.append(
+                {
+                    "signal_date": int(r.signal_date),
+                    "target_pos_rb": int(current_dir["rb"]),
+                    "target_pos_i": int(current_dir["i"]),
+                    "target_pos_j": int(current_dir["j"]),
+                }
+            )
+
+        target_daily = pd.DataFrame(target_dir_rows)
+
+        # 回填到长表，并生成模板常用字段 target_pos
+        out = out.merge(target_daily, on="signal_date", how="left")
+        out["target_pos"] = 0
+        out.loc[out["symbol"] == "rb", "target_pos"] = out.loc[out["symbol"] == "rb", "target_pos_rb"]
+        out.loc[out["symbol"] == "i", "target_pos"] = out.loc[out["symbol"] == "i", "target_pos_i"]
+        out.loc[out["symbol"] == "j", "target_pos"] = out.loc[out["symbol"] == "j", "target_pos_j"]
+
+        out = out.drop(columns=["target_pos_rb", "target_pos_i", "target_pos_j"])
+        return out
+
+    # ---------------------------------------------------------------------
+    # E) 执行数据：取 trade_date 的主力开盘价（Open）作为执行价
+    # ---------------------------------------------------------------------
+    def build_execution_table(self, signal_df: pd.DataFrame, main_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        模板同款：构造执行表（signal_date -> trade_date）。
+
+        这里我们需要 trade_date 的执行价格（Open），所以会再次按 trade_date 去取数：
+        - 输入：signal_df（长表，含 signal_date, trade_signal）、main_df（映射含 trade_date）
+        - 输出：exec_df（逐 trade_date、逐品种，含 exec_contract 与 exec_px）
+        """
+        # 1) 先取每个 signal_date 对应的 target_pos（已是“持有型目标方向”）
+        sig = (
+            signal_df[["signal_date", "signal", "profit", "state"]]
+            .drop_duplicates("signal_date")
+            .copy()
+        )
+
+        # 2) 准备 trade_date 侧的查询映射
+        exec_map = main_df[["symbol", "trade_date", "contract", "signal_date"]].copy()
+
+        unique_dates = sorted(exec_map["trade_date"].unique().tolist())
+        parts: List[pd.DataFrame] = []
+        for i in range(0, len(unique_dates), self.date_chunk_size):
+            date_chunk = unique_dates[i : i + self.date_chunk_size]
+            chunk = exec_map[exec_map["trade_date"].isin(date_chunk)].copy()
+            query_contract_df = self._build_query_contract_df_for_chunk(
+                chunk, date_col="trade_date", contract_col="contract"
+            )
+            if query_contract_df.empty:
+                continue
+            chunk_daily = get_fut_daily_data(query_contract_df).copy()
+            chunk_daily.columns = [c.strip() for c in chunk_daily.columns]
+            chunk_daily["Varity"] = chunk_daily["Varity"].astype(str).str.lower()
+            chunk_daily["Date"] = chunk_daily["Date"].astype(int)
+            chunk_daily = chunk_daily.rename(
+                columns={"Varity": "symbol", "Contract": "contract", "Date": "trade_date"}
+            )
+            parts.append(chunk_daily)
+
+        if not parts:
+            return pd.DataFrame()
+
+        exec_daily = pd.concat(parts, axis=0, ignore_index=True)
+        exec_daily = exec_daily.merge(exec_map, on=["symbol", "trade_date", "contract"], how="inner")
+
+        if "Open" not in exec_daily.columns:
+            raise ValueError("执行数据缺少 Open 字段，无法按开盘执行")
+
+        exec_daily["exec_px"] = exec_daily["Open"].astype(float)
+
+        # 盯盘使用收盘价：用于回测 mark-to-market
+        if "Close" in exec_daily.columns:
+            exec_daily["exec_close_px"] = exec_daily["Close"].astype(float)
+        elif "LastPrice" in exec_daily.columns:
+            exec_daily["exec_close_px"] = exec_daily["LastPrice"].astype(float)
+        elif "SettlePrice" in exec_daily.columns:
+            exec_daily["exec_close_px"] = exec_daily["SettlePrice"].astype(float)
+        else:
+            raise ValueError("执行数据缺少 Close/LastPrice/SettlePrice 字段，无法生成收盘价盯盘价格")
+
+        # 3) 合并信号
+        exec_df = exec_daily.merge(sig, on="signal_date", how="left")
+        exec_df = exec_df.merge(
+            signal_df[["symbol", "signal_date", "target_pos"]].drop_duplicates(["symbol", "signal_date"]),
+            on=["symbol", "signal_date"],
+            how="left",
+        )
+        exec_df = exec_df.rename(
+            columns={
+                "trade_date": "date",
+                "contract": "exec_contract",
+            }
+        )
+        # 模板同款字段：decision_date(=signal_date) -> date(=trade_date)
+        exec_df = exec_df.rename(columns={"signal_date": "decision_date"})
+        keep = [
+            "date",
+            "decision_date",
+            "symbol",
+            "exec_contract",
+            "exec_px",
+            "exec_close_px",
+            "target_pos",
+            "signal",
+            "profit",
+            "state",
+        ]
+        return exec_df[keep].sort_values(["date", "symbol"]).reset_index(drop=True)
+
+    # ---------------------------------------------------------------------
+    # F) 手数与费用：复现 order_target_value + get_fut_fee
+    # ---------------------------------------------------------------------
+    def calc_lots_by_cash(self, symbol: str, price: float, cash_budget: float) -> int:
+        """
+        把“目标市值 target_value”换算成手数。
+
+        order_target_value 的直觉：目标名义金额 = price * multiplier * lots
+        => lots = floor(target_value / (price * multiplier))
+        """
+        if price is None or np.isnan(price) or price <= 0:
+            return 0
+        mult = int(self.multiplier_map.get(symbol.lower(), 1))
+        return max(int(math.floor(float(cash_budget) / (float(price) * mult))), 0)
+
+    def calc_spread_lots(
+        self,
+        price_rb: float,
+        price_i: float,
+        price_j: float,
+        capital: float,
+    ) -> Tuple[int, int, int]:
+        """
+        按螺纹钢套利策略的资金分配方法计算三腿手数。
+
+        资金分配：
+        - a,b,c = g.y*g.z, g.x*g.z, g.y*g.z
+        - cash_rb = (a/(a+b+c))*cash
+        - cash_i  = (b/(a+b+c))*cash
+        - cash_j  = (c/(a+b+c))*cash
+
+        然后把每一腿的目标资金 cash_sym 按价格/合约乘数折算成 lots。
+        """
+        a = float(self.y_i * self.z_j)
+        b = float(self.x_rb * self.z_j)
+        c = float(self.y_i * self.z_j)
+        s = a + b + c
+        if s <= 0 or capital <= 0:
+            return 0, 0, 0
+
+        cash_rb = (a / s) * float(capital)
+        cash_i = (b / s) * float(capital)
+        cash_j = (c / s) * float(capital)
+
+        rb_lots = self.calc_lots_by_cash("rb", float(price_rb), cash_rb)
+        i_lots = self.calc_lots_by_cash("i", float(price_i), cash_i)
+        j_lots = self.calc_lots_by_cash("j", float(price_j), cash_j)
+
+        # 防止被截断为 0（保持和原先实现一致的“只要 rb_lots>0，就保证 i/j 至少 1”）
+        if rb_lots > 0:
+            if i_lots == 0 and price_i and price_i > 0:
+                i_lots = 1
+            if j_lots == 0 and price_j and price_j > 0:
+                j_lots = 1
+
+        return int(rb_lots), int(i_lots), int(j_lots)
+
+    def compute_spread_lots(self, prices: Dict[str, float]) -> Dict[str, int]:
+
+        rb_p = float(prices.get("rb", 0.0) or 0.0)
+        i_p = float(prices.get("i", 0.0) or 0.0)
+        j_p = float(prices.get("j", 0.0) or 0.0)
+        rb_lots, i_lots, j_lots = self.calc_spread_lots(
+            price_rb=rb_p,
+            price_i=i_p,
+            price_j=j_p,
+            capital=self.cash_total,
+        )
+        return {"rb": rb_lots, "i": i_lots, "j": j_lots}
+
+    def calc_fee(self, contract: str, price: float, lots: int, date_int: int, ex_type: int) -> float:
+        if lots <= 0:
+            return 0.0
+
+        try:
+            result = get_fut_fee(
+                query_list_tuple=[(contract, 0, price * lots)],
+                exType=ex_type,
+                date=int(date_int),
+            )
+            if isinstance(result, list) and len(result) > 0:
+                return float(result[0][1])
+        except Exception:
+            pass
+        fee = 0.0001 * price * lots
+        return fee
+
+    def calc_slippage(self, symbol: str, price: float, lots: int) -> float:
+        """
+        滑点成本：按成交名义价值的一侧比例计提。
+        名义价值（货币计）= price * multiplier * lots
+        """
+        if lots <= 0 or price is None or np.isnan(price) or price <= 0:
+            return 0.0
+        mult = int(self.multiplier_map.get(symbol.lower(), 1))
+        return float(price) * float(mult) * float(lots) * float(self.slippage_one_side_rate)
+
+    # ---------------------------------------------------------------------
+    # G) 回测：严格按 trade_date 逐日推进
+    # ---------------------------------------------------------------------
+    def backtest_portfolio_strict(self, exec_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        严格回测的核心是“按 trade_date 执行”。
+
+        JoinQuant market_open 的关键顺序：
+        1) 冷却期：直接清仓
+        2) 否则先 rolling_risk（用账户总值判断回撤）
+           - 触发：risk_days=0，今天不交易（pass）
+           - 未触发：执行 trade()（只有 signal=2/-2 才下单）
+        3) trade() 之后才有移仓换月逻辑（主力变化时换仓）
+        4) 每天末尾 risk_days += 1
+        """
+        exec_full = exec_df.copy().sort_values(["date", "symbol"]).reset_index(drop=True)
+        # 3) 逐日推进：持仓状态（每条腿单独记录）
+        pos_state: Dict[str, Dict[str, object]] = {
+            sym: {"pos": 0, "lots": 0, "contract": None, "prev_mark": np.nan} for sym in self.symbols
+        }
+
+        # 风控状态：参考策略初值
+        risk_days = self.risk_days_window
+        tot_values = [self.capital] * self.risk_days_window
+
+        total_value = self.capital
+        detail_rows: List[dict] = []
+        port_rows: List[dict] = []
+
+        all_dates = sorted(exec_full["date"].unique().tolist())
+
+        for d in all_dates:
+            day = exec_full[exec_full["date"] == d].copy()
+            if len(day) != len(self.symbols):
+                # 理论上每个交易日应有 rb/i/j 三条；缺失时跳过该日，避免错误对齐
+                continue
+
+            day = day.sort_values("symbol").reset_index(drop=True)
+            decision_date = int(day.loc[0, "decision_date"])
+
+            # A) 先盯市：用收盘价对上一日 prev_mark 计算已持仓盈亏（昨收->今收）
+            gross_pnl = 0.0
+            entry_pnl = 0.0  # 当天新开仓：按 (今收 - 今开) 计入当日收益
+            for sym in self.symbols:
+                st = pos_state[sym]
+                px_today_close = float(day.loc[day["symbol"] == sym, "exec_close_px"].iloc[0])
+                if st["pos"] != 0 and int(st["lots"]) > 0 and pd.notna(st["prev_mark"]):
+                    mult = int(self.multiplier_map.get(sym, 1))
+                    gross_pnl += int(st["pos"]) * (px_today_close - float(st["prev_mark"])) * mult * int(st["lots"])
+
+            value_before_fee = total_value + gross_pnl
+
+            # B) 冷却 or rolling_risk
+            day_fee = 0.0
+            day_slip = 0.0
+            risk_triggered = False
+            cooldown_active = risk_days < self.risk_days_window
+
+            actions: List[str] = []
+
+            if cooldown_active:
+                # 冷却期：清仓
+                for sym in self.symbols:
+                    st = pos_state[sym]
+                    if st["pos"] != 0 and int(st["lots"]) > 0 and st["contract"]:
+                        px_today = float(day.loc[day["symbol"] == sym, "exec_px"].iloc[0])  # 成交用开盘价
+                        day_fee += self.calc_fee(
+                            contract=str(st["contract"]),
+                            price=px_today,
+                            lots=int(st["lots"]),
+                            date_int=int(d),
+                            ex_type=2,  # 平昨（教学版用 2）
+                        )
+                        day_slip += self.calc_slippage(sym, px_today, int(st["lots"]))
+                    st.update({"pos": 0, "lots": 0, "contract": None, "prev_mark": np.nan})
+                actions.append("COOLDOWN_FLATTEN")
+            else:
+                # rolling_risk：用“当天盯市后的账户总值（扣费前）”更新滚动序列
+                tot_values.append(float(value_before_fee))
+                tot_values = tot_values[1:]
+
+                peak = max(tot_values) if tot_values else float(value_before_fee)
+                max_down = 1.0 - float(value_before_fee) / peak if peak > 0 else 0.0
+
+                if max_down >= self.max_drawdown:
+                    # 触发风控：今天 pass，不交易；并进入冷却
+                    risk_triggered = True
+                    risk_days = 0
+                    tot_values = [float(value_before_fee)] * self.risk_days_window
+                    actions.append("RISK_TRIGGERED_PASS")
+                else:
+                    # 模板同款：每日都有 target_pos；只有 need_change 时才 EXIT/ENTER
+                    px_today_map = {
+                        s: float(day.loc[day["symbol"] == s, "exec_px"].iloc[0]) for s in self.symbols
+                    }
+                    spread_active = any(
+                        int(day.loc[day["symbol"] == s, "target_pos"].iloc[0]) != 0
+                        for s in self.symbols
+                    )
+                    if spread_active:
+                        rb_lots, i_lots, j_lots = self.calc_spread_lots(
+                            price_rb=px_today_map["rb"],
+                            price_i=px_today_map["i"],
+                            price_j=px_today_map["j"],
+                            capital=self.cash_total,
+                        )
+                        target_lots_map = {"rb": rb_lots, "i": i_lots, "j": j_lots}
+                    else:
+                        target_lots_map = {s: 0 for s in self.symbols}
+                    for sym in self.symbols:
+                        st = pos_state[sym]
+                        row = day.loc[day["symbol"] == sym].iloc[0]
+
+                        target_pos = int(row["target_pos"]) if pd.notna(row["target_pos"]) else 0
+                        exec_contract = str(row["exec_contract"])
+                        px_today = float(row["exec_px"])  # 成交用开盘价
+                        px_today_close = float(row["exec_close_px"])  # 盯盘用收盘价
+                        target_lots = int(target_lots_map.get(sym, 0)) if target_pos != 0 else 0
+
+                        current_pos = int(st["pos"])
+                        current_lots = int(st["lots"])
+                        current_contract = st["contract"]
+
+                        need_change = False
+                        if current_pos != target_pos:
+                            need_change = True
+                        elif current_pos != 0 and current_contract is not None and str(current_contract) != str(exec_contract):
+                            need_change = True
+
+                        if need_change:
+                            # 先平旧
+                            if current_pos != 0 and current_lots > 0 and current_contract:
+                                day_fee += self.calc_fee(
+                                    contract=str(current_contract),
+                                    price=px_today,
+                                    lots=int(current_lots),
+                                    date_int=int(d),
+                                    ex_type=2,
+                                )
+                                day_slip += self.calc_slippage(sym, px_today, int(current_lots))
+                                actions.append(f"EXIT_{sym.upper()}_{'LONG' if current_pos == 1 else 'SHORT'}")
+
+                            # 再开新
+                            st["pos"] = 0
+                            st["lots"] = 0
+                            st["contract"] = None
+
+                            if target_pos != 0 and target_lots > 0:
+                                day_fee += self.calc_fee(
+                                    contract=str(exec_contract),
+                                    price=px_today,
+                                    lots=int(target_lots),
+                                    date_int=int(d),
+                                    ex_type=0,
+                                )
+                                day_slip += self.calc_slippage(sym, px_today, int(target_lots))
+                                st["pos"] = int(target_pos)
+                                st["lots"] = int(target_lots)
+                                st["contract"] = str(exec_contract)
+                                # 新开仓当日收益：按 (今收 - 今开) 计入
+                                mult = int(self.multiplier_map.get(sym, 1))
+                                entry_pnl += int(st["pos"]) * (px_today_close - px_today) * mult * int(st["lots"])
+                                actions.append(f"ENTER_{sym.upper()}_{'LONG' if target_pos == 1 else 'SHORT'}")
+                        else:
+                            actions.append(f"HOLD_{sym.upper()}")
+
+
+
+            # D) 记账：净收益 = gross_pnl - fee
+            gross_pnl_total = float(gross_pnl) + float(entry_pnl)
+            net_pnl = float(gross_pnl_total) - float(day_fee) - float(day_slip)
+            total_value = float(value_before_fee) + float(entry_pnl) - float(day_fee) - float(day_slip)
+
+            # E) 更新 prev_mark：盯盘基准使用收盘价
+            for sym in self.symbols:
+                st = pos_state[sym]
+                px_today_close = float(day.loc[day["symbol"] == sym, "exec_close_px"].iloc[0])
+                if st["pos"] != 0 and int(st["lots"]) > 0:
+                    st["prev_mark"] = px_today_close
+
+                detail_rows.append(
+                    {
+                        "date": int(d),
+                        "decision_date": int(decision_date),
+                        "symbol": sym,
+                        "target_pos": int(day.loc[day["symbol"] == sym, "target_pos"].iloc[0])
+                        if pd.notna(day.loc[day["symbol"] == sym, "target_pos"].iloc[0])
+                        else 0,
+                        "position": int(st["pos"]),
+                        "lots": int(st["lots"]),
+                        "contract": st["contract"],
+                        "mark_price": px_today_close,
+                        "cooldown_active": bool(cooldown_active),
+                        "risk_triggered": bool(risk_triggered),
+                        "action": "|".join(actions) if actions else "NONE",
+                    }
+                )
+
+            port_rows.append(
+                {
+                    "date": int(d),
+                    "decision_date": int(decision_date),
+                    "signal": int(day.loc[0, "signal"]) if pd.notna(day.loc[0, "signal"]) else 0,
+                    "gross_pnl": float(gross_pnl_total),
+                    "fee": float(day_fee),
+                    "net_pnl": float(net_pnl),
+                    "total_value": float(total_value),
+                    "action": "|".join(actions) if actions else "NONE",
+                }
+            )
+
+            # F) risk_days++
+            risk_days += 1
+
+        detail = pd.DataFrame(detail_rows).sort_values(["date", "symbol"]).reset_index(drop=True)
+        portfolio = pd.DataFrame(port_rows).sort_values("date").reset_index(drop=True)
+
+        portfolio["strategy_ret"] = portfolio["net_pnl"] / self.capital
+        portfolio["nav"] = (1.0 + portfolio["strategy_ret"].fillna(0.0)).cumprod()
+
+        return detail, portfolio
+
+    # ---------------------------------------------------------------------
+    # H) 指标：收益率、夏普、回撤等（表格输出）
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def calc_metrics(portfolio_df: pd.DataFrame) -> Dict[str, float]:
+        """
+        输出一个“可直接 print 的表格”。
+        """
+        if portfolio_df.empty:
+            return {}
+
+        ret = portfolio_df["strategy_ret"].fillna(0.0)
+        nav = portfolio_df["nav"].fillna(1.0)
+
+        total_return = float(nav.iloc[-1] - 1.0)
+        annual_return = float(nav.iloc[-1] ** (244 / len(nav)) - 1.0) if len(nav) > 0 else np.nan
+        annual_vol = float(ret.std(ddof=0) * math.sqrt(244)) if len(ret) > 1 else np.nan
+        sharpe = float(annual_return / annual_vol) if annual_vol and annual_vol > 0 else np.nan
+
+        running_max = nav.cummax()
+        drawdown = nav / running_max - 1.0
+        max_drawdown = float(drawdown.min()) if len(drawdown) > 0 else np.nan
+        win_rate = float((ret > 0).mean()) if len(ret) > 0 else np.nan
+
+        return {
+            "total_return": total_return,
+            "annual_return": annual_return,
+            "annual_vol": annual_vol,
+            "sharpe": sharpe,
+            "max_drawdown": max_drawdown,
+            "win_rate": win_rate,
+        }
+
+    # ---------------------------------------------------------------------
+    # I) 一键运行：数据准备 -> 信号 -> 执行数据 -> 回测 -> 输出
+    # ---------------------------------------------------------------------
+    def run(self) -> Dict[str, object]:
+        """
+        一键跑完：
+        1) 主力映射
+        2) 信号日行情 -> 连续化 -> profit -> signal
+        3) 执行日行情（trade_date）-> 开盘执行价
+        4) 严格回测
+        """
+        main_df = self.get_main_contracts()
+        daily_df = self.get_main_daily_data_chunked(main_df)
+        adjusted_df = self.build_adjusted_price(daily_df)
+        indicator_df = self.add_indicators(adjusted_df)
+        signal_df = self.generate_target_signal(indicator_df)
+        exec_df = self.build_execution_table(signal_df, main_df)
+        detail_df, portfolio_df = self.backtest_portfolio_strict(exec_df)
+        metrics = self.calc_metrics(portfolio_df)
+
+        # 指标表格（和模板输出风格一致）
+        metric_name_map = {
+            "total_return": "总收益率",
+            "annual_return": "年化收益率",
+            "annual_vol": "年化波动率",
+            "sharpe": "夏普比率",
+            "max_drawdown": "最大回撤",
+            "win_rate": "胜率",
+        }
+        rows = []
+        for k, v in metrics.items():
+            name = metric_name_map.get(k, k)
+            if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+                rows.append((name, "NaN"))
+            elif k == "sharpe":
+                rows.append((name, f"{float(v):.4f}"))
+            else:
+                rows.append((name, f"{float(v) * 100:.4f}%"))
+        metrics_table = pd.DataFrame(rows, columns=["指标", "数值"]).set_index("指标")
+
+        return {
+            "main_df": main_df,
+            "daily_df": daily_df,
+            "adjusted_df": adjusted_df,
+            "signal_df": signal_df,
+            "exec_df": exec_df,
+            "detail_df": detail_df,
+            "portfolio_df": portfolio_df,
+            "metrics": metrics,
+            "metrics_table": metrics_table,
+        }
+
+
+if __name__ == "__main__":
+    strat = RbSteelProfitArbitrageRuleShapeClose(
+        start_date=20131230,
+        end_date=20190110,
+        capital=10_000_000.0,
+        cash_ratio=0.10,
+        ma_window=15,
+        up_std=1.8,
+        down_std=1.8,
+        x_rb=1.0,
+        y_i=1.6,
+        z_j=0.5,
+        risk_days_window=10,
+        max_drawdown=0.03,
+        date_chunk_size=20,
+        adjust_method="additive",
+        use_settle_for_signal=False,
+    )
+
+    res = strat.run()
+    print("=== 回测指标（表格）===")
+    print(res["metrics_table"])
+
+    res["portfolio_df"].to_csv("rb_steel_profit_portfolio.csv", index=False, encoding="utf-8-sig")
+    res["detail_df"].to_csv("rb_steel_profit_detail.csv", index=False, encoding="utf-8-sig")
+
